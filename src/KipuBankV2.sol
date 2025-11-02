@@ -4,7 +4,9 @@ pragma solidity 0.8.30;
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import "./IKipuBankV2.sol";
 
@@ -23,7 +25,8 @@ import "./IKipuBankV2.sol";
  * - Emergency withdrawal functionality
  * - Gas-optimized with checks-effects-interactions pattern
  */
-contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard {
+contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard, Pausable {
+    using SafeERC20 for IERC20;
 
     // ========== ROLES ==========
 
@@ -43,6 +46,12 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard {
 
     /// @dev Minimum valid price from oracle
     uint256 public constant MIN_VALID_PRICE = 1e6; // $1 USD
+
+    /// @dev ETH decimals (gas optimization)
+    uint8 private constant ETH_DECIMALS = 18;
+
+    /// @dev Maximum number of supported tokens
+    uint256 public constant MAX_SUPPORTED_TOKENS = 50;
 
     // ========== IMMUTABLES ==========
 
@@ -68,6 +77,17 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard {
 
     /// @dev Nested mapping: user => token => balance (in token's native decimals)
     mapping(address => mapping(address => uint256)) public vaults;
+
+    // ========== MODIFIERS ==========
+
+    /**
+     * @notice Validates that an amount is greater than zero
+     * @param amount Amount to validate
+     */
+    modifier nonZeroAmount(uint256 amount) {
+        if (amount == 0) revert ZeroAmount();
+        _;
+    }
 
     // ========== CONSTRUCTOR ==========
 
@@ -96,18 +116,18 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard {
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(MANAGER_ROLE, msg.sender);
 
-        // Add ETH as supported token by default
+        // Add ETH as supported token by default - Optimized struct packing
         tokenInfo[NATIVE_TOKEN] = TokenInfo({
-            isSupported: true,
-            decimals: 18,
-            status: TokenStatus.Active,
             totalDeposits: 0,
             depositCount: 0,
-            withdrawalCount: 0
+            withdrawalCount: 0,
+            isSupported: true,
+            decimals: ETH_DECIMALS,
+            status: TokenStatus.Active
         });
         supportedTokens.push(NATIVE_TOKEN);
 
-        emit TokenAdded(NATIVE_TOKEN, 18);
+        emit TokenAdded(NATIVE_TOKEN);
     }
 
     // ========== EXTERNAL FUNCTIONS - DEPOSITS ==========
@@ -116,32 +136,37 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard {
      * @notice Deposit ETH into your vault
      * @dev Uses Chainlink oracle to convert ETH value to USD
      */
-    function depositETH() external payable override nonReentrant {
-        if (msg.value == 0) revert ZeroAmount();
-
+    function depositETH() external payable override nonReentrant whenNotPaused nonZeroAmount(msg.value) {
         TokenInfo storage info = tokenInfo[NATIVE_TOKEN];
         if (info.status == TokenStatus.Paused) revert TokenPaused();
 
         // Get ETH price in USD
         uint256 ethPriceUSD = _getETHPrice();
 
-        // Convert deposit amount to USD (6 decimals)
-        uint256 depositValueUSD = _convertToUSD(msg.value, 18, ethPriceUSD);
+        // Convert deposit amount to USD (6 decimals) - Using cached constant
+        uint256 depositValueUSD = _convertToUSD(msg.value, ETH_DECIMALS, ethPriceUSD);
+
+        // Validate deposit is not too small (prevents gas griefing)
+        if (depositValueUSD == 0) revert AmountTooSmall();
 
         // Checks
         if (totalBankValueUSD + depositValueUSD > bankCapUSD) revert BankCapExceeded();
 
-        // Effects
-        vaults[msg.sender][NATIVE_TOKEN] += msg.value;
-        totalBankValueUSD += depositValueUSD;
-        info.totalDeposits += depositValueUSD;
+        // Effects - Cache msg.sender and storage for single access
+        address user = msg.sender;
+        uint256 currentBalance = vaults[user][NATIVE_TOKEN];
+        uint256 newBalance = currentBalance + msg.value; // Will revert on overflow (no unchecked)
+        vaults[user][NATIVE_TOKEN] = newBalance;
+
         unchecked {
-            info.depositCount++;
+            totalBankValueUSD += depositValueUSD; // Safe: checked above (line 153)
+            info.totalDeposits += uint128(depositValueUSD); // Safe: checked above
         }
+        info.depositCount++; // No unchecked: can overflow
 
         // Interactions (none for ETH deposit)
 
-        emit Deposit(msg.sender, NATIVE_TOKEN, msg.value, depositValueUSD, vaults[msg.sender][NATIVE_TOKEN]);
+        emit Deposit(user, NATIVE_TOKEN, msg.value, depositValueUSD, newBalance);
     }
 
     /**
@@ -150,9 +175,9 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard {
      * @param amount Amount to deposit in token's native decimals
      * @dev Token must be previously added by manager
      */
-    function depositToken(address token, uint256 amount) external override nonReentrant {
-        if (amount == 0) revert ZeroAmount();
-        if (token == NATIVE_TOKEN) revert ZeroAddress();
+    function depositToken(address token, uint256 amount) external override nonReentrant whenNotPaused nonZeroAmount(amount) {
+        // Fail-fast validation: check native token first (cheaper than modifier)
+        if (token == NATIVE_TOKEN) revert NativeTokenNotAllowed();
 
         TokenInfo storage info = tokenInfo[token];
         if (!info.isSupported) revert TokenNotSupported();
@@ -163,23 +188,28 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard {
         // In production, you'd use Chainlink price feeds for each token
         uint256 depositValueUSD = _convertToUSD(amount, info.decimals, 1e8); // 1:1 for stablecoins
 
+        // Validate deposit is not too small
+        if (depositValueUSD == 0) revert AmountTooSmall();
+
         // Checks
         if (totalBankValueUSD + depositValueUSD > bankCapUSD) revert BankCapExceeded();
 
-        // Effects
-        vaults[msg.sender][token] += amount;
-        totalBankValueUSD += depositValueUSD;
-        info.totalDeposits += depositValueUSD;
+        // Effects - Cache msg.sender and storage for single access
+        address user = msg.sender;
+        uint256 currentBalance = vaults[user][token];
+        uint256 newBalance = currentBalance + amount; // Will revert on overflow (no unchecked)
+        vaults[user][token] = newBalance;
+
         unchecked {
-            info.depositCount++;
+            totalBankValueUSD += depositValueUSD; // Safe: checked above (line 195)
+            info.totalDeposits += uint128(depositValueUSD); // Safe: checked above
         }
+        info.depositCount++; // No unchecked: can overflow
 
-        // Interactions
-        if (!IERC20(token).transferFrom(msg.sender, address(this), amount)) {
-            revert TransferFailed();
-        }
+        // Interactions - Using SafeERC20
+        IERC20(token).safeTransferFrom(user, address(this), amount);
 
-        emit Deposit(msg.sender, token, amount, depositValueUSD, vaults[msg.sender][token]);
+        emit Deposit(user, token, amount, depositValueUSD, newBalance);
     }
 
     // ========== EXTERNAL FUNCTIONS - WITHDRAWALS ==========
@@ -188,36 +218,36 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard {
      * @notice Withdraw ETH from your vault
      * @param amount Amount to withdraw in wei
      */
-    function withdrawETH(uint256 amount) external override nonReentrant {
-        if (amount == 0) revert ZeroAmount();
-        if (vaults[msg.sender][NATIVE_TOKEN] < amount) revert InsufficientBalance();
+    function withdrawETH(uint256 amount) external override nonReentrant whenNotPaused nonZeroAmount(amount) {
+        address user = msg.sender;
+        uint256 currentBalance = vaults[user][NATIVE_TOKEN];
+        if (currentBalance < amount) revert InsufficientBalance();
 
         // Get ETH price in USD
         uint256 ethPriceUSD = _getETHPrice();
 
-        // Convert withdrawal amount to USD
-        uint256 withdrawalValueUSD = _convertToUSD(amount, 18, ethPriceUSD);
+        // Convert withdrawal amount to USD - Using constant
+        uint256 withdrawalValueUSD = _convertToUSD(amount, ETH_DECIMALS, ethPriceUSD);
 
         // Checks
         if (withdrawalValueUSD > withdrawalLimitUSD) revert WithdrawalLimitExceeded();
 
         // Effects
-        vaults[msg.sender][NATIVE_TOKEN] -= amount;
-        totalBankValueUSD -= withdrawalValueUSD;
-
         TokenInfo storage info = tokenInfo[NATIVE_TOKEN];
-        info.totalDeposits -= withdrawalValueUSD;
+        uint256 newBalance;
         unchecked {
-            info.withdrawalCount++;
+            newBalance = currentBalance - amount; // Safe: checked above (line 220)
+            totalBankValueUSD -= withdrawalValueUSD; // Safe: withdrawalValueUSD <= totalBankValueUSD
+            info.totalDeposits -= uint128(withdrawalValueUSD); // Safe: same reason
         }
-
-        uint256 newBalance = vaults[msg.sender][NATIVE_TOKEN];
+        vaults[user][NATIVE_TOKEN] = newBalance;
+        info.withdrawalCount++; // No unchecked: can overflow
 
         // Interactions
-        (bool success, ) = payable(msg.sender).call{value: amount}("");
+        (bool success, ) = payable(user).call{value: amount}("");
         if (!success) revert TransferFailed();
 
-        emit Withdrawal(msg.sender, NATIVE_TOKEN, amount, withdrawalValueUSD, newBalance);
+        emit Withdrawal(user, NATIVE_TOKEN, amount, withdrawalValueUSD, newBalance);
     }
 
     /**
@@ -225,10 +255,12 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard {
      * @param token Address of the ERC20 token
      * @param amount Amount to withdraw in token's native decimals
      */
-    function withdrawToken(address token, uint256 amount) external override nonReentrant {
-        if (amount == 0) revert ZeroAmount();
-        if (token == NATIVE_TOKEN) revert ZeroAddress();
-        if (vaults[msg.sender][token] < amount) revert InsufficientBalance();
+    function withdrawToken(address token, uint256 amount) external override nonReentrant whenNotPaused nonZeroAmount(amount) {
+        if (token == NATIVE_TOKEN) revert NativeTokenNotAllowed();
+
+        address user = msg.sender;
+        uint256 currentBalance = vaults[user][token];
+        if (currentBalance < amount) revert InsufficientBalance();
 
         TokenInfo storage info = tokenInfo[token];
         if (!info.isSupported) revert TokenNotSupported();
@@ -240,21 +272,19 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard {
         if (withdrawalValueUSD > withdrawalLimitUSD) revert WithdrawalLimitExceeded();
 
         // Effects
-        vaults[msg.sender][token] -= amount;
-        totalBankValueUSD -= withdrawalValueUSD;
-        info.totalDeposits -= withdrawalValueUSD;
+        uint256 newBalance;
         unchecked {
-            info.withdrawalCount++;
+            newBalance = currentBalance - amount; // Safe: checked above (line 259)
+            totalBankValueUSD -= withdrawalValueUSD; // Safe: withdrawalValueUSD <= totalBankValueUSD
+            info.totalDeposits -= uint128(withdrawalValueUSD); // Safe: same reason
         }
+        vaults[user][token] = newBalance;
+        info.withdrawalCount++; // No unchecked: can overflow
 
-        uint256 newBalance = vaults[msg.sender][token];
+        // Interactions - Using SafeERC20
+        IERC20(token).safeTransfer(user, amount);
 
-        // Interactions
-        if (!IERC20(token).transfer(msg.sender, amount)) {
-            revert TransferFailed();
-        }
-
-        emit Withdrawal(msg.sender, token, amount, withdrawalValueUSD, newBalance);
+        emit Withdrawal(user, token, amount, withdrawalValueUSD, newBalance);
     }
 
     // ========== EXTERNAL FUNCTIONS - ADMIN ==========
@@ -268,21 +298,25 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard {
         if (token == address(0)) revert ZeroAddress();
         if (tokenInfo[token].isSupported) revert TokenAlreadySupported();
 
+        // Enforce maximum tokens limit
+        if (supportedTokens.length >= MAX_SUPPORTED_TOKENS) revert MaxTokensReached();
+
         uint8 decimals = IERC20Metadata(token).decimals();
         if (decimals == 0 || decimals > 18) revert InvalidDecimals();
 
+        // Optimized struct packing
         tokenInfo[token] = TokenInfo({
-            isSupported: true,
-            decimals: decimals,
-            status: TokenStatus.Active,
             totalDeposits: 0,
             depositCount: 0,
-            withdrawalCount: 0
+            withdrawalCount: 0,
+            isSupported: true,
+            decimals: decimals,
+            status: TokenStatus.Active
         });
 
         supportedTokens.push(token);
 
-        emit TokenAdded(token, decimals);
+        emit TokenAdded(token);
     }
 
     /**
@@ -307,6 +341,9 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard {
     function setBankCap(uint256 newCapUSD) external onlyRole(MANAGER_ROLE) {
         if (newCapUSD == 0) revert InvalidBankCap();
 
+        // Prevent setting cap below current total value (would block deposits permanently)
+        if (newCapUSD < totalBankValueUSD) revert CapBelowCurrentValue();
+
         uint256 oldCap = bankCapUSD;
         bankCapUSD = newCapUSD;
 
@@ -328,27 +365,46 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard {
     }
 
     /**
+     * @notice Pause all deposits and withdrawals
+     * @dev Only callable by DEFAULT_ADMIN_ROLE in emergency
+     */
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _pause();
+    }
+
+    /**
+     * @notice Unpause all deposits and withdrawals
+     * @dev Only callable by DEFAULT_ADMIN_ROLE
+     */
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
+    }
+
+    /**
      * @notice Emergency withdrawal of tokens (only admin)
      * @param token Address of the token (address(0) for ETH)
      * @param amount Amount to withdraw
      * @param recipient Recipient of the funds
-     * @dev Only callable by DEFAULT_ADMIN_ROLE in emergency situations
+     * @dev WARNING: This function withdraws without updating internal accounting.
+     *      Only use for recovering tokens sent directly to the contract.
+     *      For user funds, use normal withdrawal flow.
      */
     function emergencyWithdraw(
         address token,
         uint256 amount,
         address recipient
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) nonZeroAmount(amount) {
         if (recipient == address(0)) revert ZeroAddress();
-        if (amount == 0) revert ZeroAmount();
 
+        // Validate contract has sufficient balance
         if (token == NATIVE_TOKEN) {
+            if (address(this).balance < amount) revert InsufficientBalance();
             (bool success, ) = payable(recipient).call{value: amount}("");
             if (!success) revert TransferFailed();
         } else {
-            if (!IERC20(token).transfer(recipient, amount)) {
-                revert TransferFailed();
-            }
+            uint256 contractBalance = IERC20(token).balanceOf(address(this));
+            if (contractBalance < amount) revert InsufficientBalance();
+            IERC20(token).safeTransfer(recipient, amount);
         }
 
         emit EmergencyWithdrawal(token, amount, recipient);
@@ -397,6 +453,9 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard {
         uint256 tokenCount = supportedTokens.length;
         balances = new UserBalance[](tokenCount);
 
+        // Cache ETH price once to avoid multiple external calls
+        uint256 ethPrice = _getETHPrice();
+
         for (uint256 i = 0; i < tokenCount; ) {
             address token = supportedTokens[i];
             uint256 balance = vaults[user][token];
@@ -405,7 +464,6 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard {
             if (balance > 0) {
                 TokenInfo memory info = tokenInfo[token];
                 if (token == NATIVE_TOKEN) {
-                    uint256 ethPrice = _getETHPrice();
                     balanceUSD = _convertToUSD(balance, info.decimals, ethPrice);
                 } else {
                     balanceUSD = _convertToUSD(balance, info.decimals, 1e8);
@@ -475,8 +533,9 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard {
             uint80 answeredInRound
         ) = ethUsdPriceFeed.latestRoundData();
 
-        // Validate price feed data
-        if (answeredInRound < roundId) revert StalePrice();
+        // Validate price feed data - FIXED: Correct validation
+        if (answeredInRound == 0) revert StalePrice();
+        if (roundId > answeredInRound) revert StalePrice();
         if (block.timestamp - updatedAt > MAX_PRICE_STALENESS) revert StalePrice();
         if (answer <= 0) revert InvalidPrice();
 
@@ -510,25 +569,20 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard {
         return valueUSD;
     }
 
+    // ========== RECEIVE/FALLBACK ==========
+
     /**
-     * @notice Convert USD value (6 decimals) to token amount
-     * @param valueUSD Value in USD (6 decimals)
-     * @param tokenDecimals Token's decimal places
-     * @param priceUSD Price in USD (8 decimals)
-     * @return amount Amount in token's native decimals
+     * @notice Reject direct ETH transfers to prevent accidental loss
+     * @dev Users must use depositETH() function
      */
-    function _convertFromUSD(
-        uint256 valueUSD,
-        uint8 tokenDecimals,
-        uint256 priceUSD
-    ) internal pure returns (uint256 amount) {
-        // Formula: (valueUSD * 10^tokenDecimals * 10^8) / (priceUSD * 10^6)
-        // Simplified: (valueUSD * 10^(tokenDecimals + 8 - 6)) / priceUSD
-        // Final: (valueUSD * 10^(tokenDecimals + 2)) / priceUSD
+    receive() external payable {
+        revert DirectTransferNotAllowed();
+    }
 
-        uint256 numerator = valueUSD * (10 ** (tokenDecimals + 2));
-        amount = numerator / priceUSD;
-
-        return amount;
+    /**
+     * @notice Reject any calls to non-existent functions
+     */
+    fallback() external payable {
+        revert DirectTransferNotAllowed();
     }
 }

@@ -21,14 +21,15 @@ interface IKipuBankV2 {
 
     /**
      * @dev Information about a supported token
+     * @notice Optimized for gas efficiency with struct packing (2 storage slots)
      */
     struct TokenInfo {
-        bool isSupported;          // Whether token is supported
-        uint8 decimals;            // Token decimals
-        TokenStatus status;        // Current status
-        uint256 totalDeposits;     // Total deposits in USD value (normalized to 6 decimals)
-        uint256 depositCount;      // Number of deposits for this token
-        uint256 withdrawalCount;   // Number of withdrawals for this token
+        uint128 totalDeposits;     // Total deposits in USD value (normalized to 6 decimals) - slot 0
+        uint64 depositCount;       // Number of deposits for this token - slot 0
+        uint64 withdrawalCount;    // Number of withdrawals for this token - slot 0
+        bool isSupported;          // Whether token is supported - slot 1
+        uint8 decimals;            // Token decimals - slot 1
+        TokenStatus status;        // Current status - slot 1
     }
 
     /**
@@ -77,9 +78,8 @@ interface IKipuBankV2 {
     /**
      * @dev Emitted when a new token is added to the system
      * @param token Address of the token
-     * @param decimals Token decimals
      */
-    event TokenAdded(address indexed token, uint8 decimals);
+    event TokenAdded(address indexed token);
 
     /**
      * @dev Emitted when a token's status is updated
@@ -153,6 +153,21 @@ interface IKipuBankV2 {
 
     /// @dev Thrown when invalid withdrawal limit
     error InvalidWithdrawalLimit();
+
+    /// @dev Thrown when deposit amount is too small (rounds to zero USD)
+    error AmountTooSmall();
+
+    /// @dev Thrown when trying to use native token in ERC20 functions
+    error NativeTokenNotAllowed();
+
+    /// @dev Thrown when max supported tokens limit is reached
+    error MaxTokensReached();
+
+    /// @dev Thrown when bank cap is below current total value
+    error CapBelowCurrentValue();
+
+    /// @dev Thrown when direct ETH transfer is not allowed
+    error DirectTransferNotAllowed();
 
     // ========== FUNCTIONS ==========
 
