@@ -127,7 +127,6 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard, Pausable {
         });
         supportedTokens.push(NATIVE_TOKEN);
 
-        emit TokenAdded(NATIVE_TOKEN);
     }
 
     // ========== EXTERNAL FUNCTIONS - DEPOSITS ==========
@@ -137,6 +136,10 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard, Pausable {
      * @dev Uses Chainlink oracle to convert ETH value to USD
      */
     function depositETH() external payable override nonReentrant whenNotPaused nonZeroAmount(msg.value) {
+        // Cache state variables to avoid multiple SLOAD operations
+        uint256 cachedBankCap = bankCapUSD;
+        uint256 cachedTotalValue = totalBankValueUSD;
+
         TokenInfo storage info = tokenInfo[NATIVE_TOKEN];
         if (info.status == TokenStatus.Paused) revert TokenPaused();
 
@@ -149,20 +152,28 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard, Pausable {
         // Validate deposit is not too small (prevents gas griefing)
         if (depositValueUSD == 0) revert AmountTooSmall();
 
-        // Checks
-        if (totalBankValueUSD + depositValueUSD > bankCapUSD) revert BankCapExceeded();
+        // Checks - using cached values
+        if (cachedTotalValue + depositValueUSD > cachedBankCap) revert BankCapExceeded();
 
-        // Effects - Cache msg.sender and storage for single access
+        // Effects - Cache msg.sender for single access
         address user = msg.sender;
         uint256 currentBalance = vaults[user][NATIVE_TOKEN];
         uint256 newBalance = currentBalance + msg.value; // Will revert on overflow (no unchecked)
+
         vaults[user][NATIVE_TOKEN] = newBalance;
 
+        // Update state - unchecked is safe because we validated above
+        uint256 newTotalValue;
+        uint128 newTotalDeposits;
         unchecked {
-            totalBankValueUSD += depositValueUSD; // Safe: checked above (line 153)
-            info.totalDeposits += uint128(depositValueUSD); // Safe: checked above
+            newTotalValue = cachedTotalValue + depositValueUSD; // Safe: checked above
+            newTotalDeposits = info.totalDeposits + uint128(depositValueUSD); // Safe: checked above
         }
-        info.depositCount++; // No unchecked: can overflow
+        totalBankValueUSD = newTotalValue;
+        info.totalDeposits = newTotalDeposits;
+
+        // Counter increment - NOT using unchecked (can overflow theoretically)
+        info.depositCount++;
 
         // Interactions (none for ETH deposit)
 
@@ -179,6 +190,10 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard, Pausable {
         // Fail-fast validation: check native token first (cheaper than modifier)
         if (token == NATIVE_TOKEN) revert NativeTokenNotAllowed();
 
+        // Cache state variables to avoid multiple SLOAD operations
+        uint256 cachedBankCap = bankCapUSD;
+        uint256 cachedTotalValue = totalBankValueUSD;
+
         TokenInfo storage info = tokenInfo[token];
         if (!info.isSupported) revert TokenNotSupported();
         if (info.status == TokenStatus.Paused) revert TokenPaused();
@@ -191,20 +206,28 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard, Pausable {
         // Validate deposit is not too small
         if (depositValueUSD == 0) revert AmountTooSmall();
 
-        // Checks
-        if (totalBankValueUSD + depositValueUSD > bankCapUSD) revert BankCapExceeded();
+        // Checks - using cached values
+        if (cachedTotalValue + depositValueUSD > cachedBankCap) revert BankCapExceeded();
 
-        // Effects - Cache msg.sender and storage for single access
+        // Effects - Cache msg.sender for single access
         address user = msg.sender;
         uint256 currentBalance = vaults[user][token];
         uint256 newBalance = currentBalance + amount; // Will revert on overflow (no unchecked)
+
         vaults[user][token] = newBalance;
 
+        // Update state - unchecked is safe because we validated above
+        uint256 newTotalValue;
+        uint128 newTotalDeposits;
         unchecked {
-            totalBankValueUSD += depositValueUSD; // Safe: checked above (line 195)
-            info.totalDeposits += uint128(depositValueUSD); // Safe: checked above
+            newTotalValue = cachedTotalValue + depositValueUSD; // Safe: checked above
+            newTotalDeposits = info.totalDeposits + uint128(depositValueUSD); // Safe: checked above
         }
-        info.depositCount++; // No unchecked: can overflow
+        totalBankValueUSD = newTotalValue;
+        info.totalDeposits = newTotalDeposits;
+
+        // Counter increment - NOT using unchecked (can overflow theoretically)
+        info.depositCount++;
 
         // Interactions - Using SafeERC20
         IERC20(token).safeTransferFrom(user, address(this), amount);
@@ -219,6 +242,10 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard, Pausable {
      * @param amount Amount to withdraw in wei
      */
     function withdrawETH(uint256 amount) external override nonReentrant whenNotPaused nonZeroAmount(amount) {
+        // Cache state variables to avoid multiple SLOAD operations
+        uint256 cachedWithdrawalLimit = withdrawalLimitUSD;
+        uint256 cachedTotalValue = totalBankValueUSD;
+
         address user = msg.sender;
         uint256 currentBalance = vaults[user][NATIVE_TOKEN];
         if (currentBalance < amount) revert InsufficientBalance();
@@ -229,19 +256,28 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard, Pausable {
         // Convert withdrawal amount to USD - Using constant
         uint256 withdrawalValueUSD = _convertToUSD(amount, ETH_DECIMALS, ethPriceUSD);
 
-        // Checks
-        if (withdrawalValueUSD > withdrawalLimitUSD) revert WithdrawalLimitExceeded();
+        // Checks - using cached value
+        if (withdrawalValueUSD > cachedWithdrawalLimit) revert WithdrawalLimitExceeded();
 
         // Effects
         TokenInfo storage info = tokenInfo[NATIVE_TOKEN];
+
+        // Calculate new values - unchecked is safe because we validated above
         uint256 newBalance;
+        uint256 newTotalValue;
+        uint128 newTotalDeposits;
         unchecked {
-            newBalance = currentBalance - amount; // Safe: checked above (line 220)
-            totalBankValueUSD -= withdrawalValueUSD; // Safe: withdrawalValueUSD <= totalBankValueUSD
-            info.totalDeposits -= uint128(withdrawalValueUSD); // Safe: same reason
+            newBalance = currentBalance - amount; // Safe: checked above
+            newTotalValue = cachedTotalValue - withdrawalValueUSD; // Safe: withdrawalValueUSD <= totalBankValueUSD
+            newTotalDeposits = info.totalDeposits - uint128(withdrawalValueUSD); // Safe: same reason
         }
+
         vaults[user][NATIVE_TOKEN] = newBalance;
-        info.withdrawalCount++; // No unchecked: can overflow
+        totalBankValueUSD = newTotalValue;
+        info.totalDeposits = newTotalDeposits;
+
+        // Counter increment - NOT using unchecked (can overflow theoretically)
+        info.withdrawalCount++;
 
         // Interactions
         (bool success, ) = payable(user).call{value: amount}("");
@@ -258,6 +294,10 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard, Pausable {
     function withdrawToken(address token, uint256 amount) external override nonReentrant whenNotPaused nonZeroAmount(amount) {
         if (token == NATIVE_TOKEN) revert NativeTokenNotAllowed();
 
+        // Cache state variables to avoid multiple SLOAD operations
+        uint256 cachedWithdrawalLimit = withdrawalLimitUSD;
+        uint256 cachedTotalValue = totalBankValueUSD;
+
         address user = msg.sender;
         uint256 currentBalance = vaults[user][token];
         if (currentBalance < amount) revert InsufficientBalance();
@@ -268,18 +308,25 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard, Pausable {
         // Get token value in USD
         uint256 withdrawalValueUSD = _convertToUSD(amount, info.decimals, 1e8);
 
-        // Checks
-        if (withdrawalValueUSD > withdrawalLimitUSD) revert WithdrawalLimitExceeded();
+        // Checks - using cached value
+        if (withdrawalValueUSD > cachedWithdrawalLimit) revert WithdrawalLimitExceeded();
 
-        // Effects
+        // Effects - calculate new values, unchecked is safe because we validated above
         uint256 newBalance;
+        uint256 newTotalValue;
+        uint128 newTotalDeposits;
         unchecked {
-            newBalance = currentBalance - amount; // Safe: checked above (line 259)
-            totalBankValueUSD -= withdrawalValueUSD; // Safe: withdrawalValueUSD <= totalBankValueUSD
-            info.totalDeposits -= uint128(withdrawalValueUSD); // Safe: same reason
+            newBalance = currentBalance - amount; // Safe: checked above
+            newTotalValue = cachedTotalValue - withdrawalValueUSD; // Safe: withdrawalValueUSD <= totalBankValueUSD
+            newTotalDeposits = info.totalDeposits - uint128(withdrawalValueUSD); // Safe: same reason
         }
+
         vaults[user][token] = newBalance;
-        info.withdrawalCount++; // No unchecked: can overflow
+        totalBankValueUSD = newTotalValue;
+        info.totalDeposits = newTotalDeposits;
+
+        // Counter increment - NOT using unchecked (can overflow theoretically)
+        info.withdrawalCount++;
 
         // Interactions - Using SafeERC20
         IERC20(token).safeTransfer(user, amount);
@@ -326,9 +373,11 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard, Pausable {
      * @dev Only callable by MANAGER_ROLE
      */
     function setTokenStatus(address token, TokenStatus newStatus) external onlyRole(MANAGER_ROLE) {
-        if (!tokenInfo[token].isSupported) revert TokenNotSupported();
+        // Cache storage pointer to avoid multiple SLOAD operations
+        TokenInfo storage info = tokenInfo[token];
+        if (!info.isSupported) revert TokenNotSupported();
 
-        tokenInfo[token].status = newStatus;
+        info.status = newStatus;
 
         emit TokenStatusUpdated(token, newStatus);
     }
@@ -341,10 +390,13 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard, Pausable {
     function setBankCap(uint256 newCapUSD) external onlyRole(MANAGER_ROLE) {
         if (newCapUSD == 0) revert InvalidBankCap();
 
-        // Prevent setting cap below current total value (would block deposits permanently)
-        if (newCapUSD < totalBankValueUSD) revert CapBelowCurrentValue();
+        // Cache state variables to avoid multiple SLOAD operations
+        uint256 cachedTotalValue = totalBankValueUSD;
+        uint256 oldCap = bankCapUSD; // Cache old value before update
 
-        uint256 oldCap = bankCapUSD;
+        // Prevent setting cap below current total value (would block deposits permanently)
+        if (newCapUSD < cachedTotalValue) revert CapBelowCurrentValue();
+
         bankCapUSD = newCapUSD;
 
         emit BankCapUpdated(oldCap, newCapUSD);
@@ -356,9 +408,12 @@ contract KipuBankV2 is IKipuBankV2, AccessControl, ReentrancyGuard, Pausable {
      * @dev Only callable by MANAGER_ROLE
      */
     function setWithdrawalLimit(uint256 newLimitUSD) external onlyRole(MANAGER_ROLE) {
-        if (newLimitUSD == 0 || newLimitUSD > bankCapUSD) revert InvalidWithdrawalLimit();
+        // Cache state variables to avoid multiple SLOAD operations
+        uint256 cachedBankCap = bankCapUSD;
+        uint256 oldLimit = withdrawalLimitUSD; // Cache old value before update
 
-        uint256 oldLimit = withdrawalLimitUSD;
+        if (newLimitUSD == 0 || newLimitUSD > cachedBankCap) revert InvalidWithdrawalLimit();
+
         withdrawalLimitUSD = newLimitUSD;
 
         emit WithdrawalLimitUpdated(oldLimit, newLimitUSD);
